@@ -9,7 +9,7 @@ customers = [
 products = [
     {"name": "수제 버거", "price": 8500, "description": "수제로 만든 패티와 신선한 채소"},
     {"name": "감자튀김", "price": 3000, "description": "바삭한 프렌치프라이"},
-    {"name": "수제 맥주(500ml)", "price": 7000, "description": "지역 수제 맥주"}
+    {"name": "수제 맥주(500ml)", "price": 7000, "description": "지역 수수제 맥주"}
 ]
 
 def show_all():
