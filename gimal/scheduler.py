@@ -441,3 +441,4 @@ def run_scheduler(file_path: str) -> str:
     html_output = generate_full_html_schedule(schedule, unassigned)
     
     return html_output
+
