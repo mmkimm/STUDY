@@ -1,4 +1,4 @@
-# scheduler.py (최종 버전: 모든 오류 방어 및 인코딩 자동 시도 적용)
+# scheduler.py (최종 버전: R_EXTRA 사용 최소화 및 3과목 연속 금지 로직 적용)
 
 import csv
 import random
@@ -8,18 +8,22 @@ from typing import List, Dict, Tuple, Any
 # ⚙️ 설정 상수 (Configuration Constants)
 # =========================================================================
 
-ROOMS = ["1215", "1216", "1217", "1418", "R_EXTRA"] 
+ROOMS = ["1215", "1216", "1217", "1418", "R_EXTRA"]
 START_HOUR = 9
 END_HOUR = 18
 DAYS = ["월", "화", "수", "목", "금"]
 
 # 📌 배정 단위 정의
 SW_CLASSES = ["SW-1A", "SW-1B", "SW-2A", "SW-2B", "SW-3A", "SW-3B", "SW-4"]
-BD_CLASSES = ["BD-1", "BD-2", "BD-3"] 
+BD_CLASSES = ["BD-1", "BD-2", "BD-3"]
 ALL_CLASSES = SW_CLASSES + BD_CLASSES
 
 # 📌 프로그램이 필수적으로 사용할 키 목록 정의
 REQUIRED_KEYS = ["교과목명", "강좌담당교수", "수업주수", "교과목학점", "개설학년", "개설학과", "교과목코드", "수강인원"]
+PROFESSOR_PREF_KEYS = [f"{i}순위" for i in range(1, 6)]
+REQUIRED_KEYS += PROFESSOR_PREF_KEYS
+
+DAY_MAP = {day: i for i, day in enumerate(DAYS, 1)}
 
 # 🎨 학년별 색상 매핑
 COLOR_MAP = {
@@ -29,131 +33,117 @@ COLOR_MAP = {
 }
 
 # =========================================================================
-# 📚 데이터 로드 함수 (load_courses) - 최종 인코딩/데이터 오류 방어
+# 📚 데이터 로드 함수 (load_courses) - 변경 없음
 # =========================================================================
 
 def load_courses(file_path: str) -> List[Dict[str, Any]]:
     courses = []
-    
-    encoding_list = ['utf-8', 'cp949', 'latin-1'] # 시도할 인코딩 목록
+    encoding_list = ['utf-8', 'cp949', 'latin-1']
     reader = None
-    f = None # f 변수를 명시적으로 None으로 초기화
+    f = None
     
-    # 📌 1. 파일 열기 시도 (인코딩 방어 로직)
     for encoding in encoding_list:
         try:
-            # newline=''은 CSV 파일 읽기 시 줄바꿈 문제 방지에 유용
-            f = open(file_path, "r", encoding=encoding, newline='') 
+            f = open(file_path, "r", encoding=encoding, newline='')
             reader = csv.DictReader(f)
-            # 성공적으로 열렸으면 루프 탈출
-            break 
+            break
         except UnicodeDecodeError:
             if f:
-                f.close() # 실패했으면 파일 핸들 닫고 다음 인코딩 시도
+                f.close()
                 f = None
             continue
         except FileNotFoundError:
-            # 파일이 없으면 즉시 오류 발생
-            raise 
+            raise
 
     if reader is None:
-        raise ValueError("파일 인코딩 오류: UTF-8, CP949, Latin-1 인코딩으로 파일 내용을 읽을 수 없습니다. 파일을 확인해주세요.")
+        raise ValueError("파일 인코딩 오류: UTF-8, CP949, Latin-1 인코딩으로 파일 내용을 읽을 수 없습니다.")
     
-    # 파일을 닫는 로직은 데이터 처리 후에 실행
     try:
-        # 📌 2. 헤더 검사 및 오류 발생
         actual_headers = set(reader.fieldnames) if reader.fieldnames else set()
         required_keys = set(REQUIRED_KEYS)
-        
         missing_keys = required_keys - actual_headers
         
         if missing_keys:
             raise ValueError(f"헤더 오류: 다음 필수 헤더가 누락되었거나 이름이 잘못되었습니다. -> **{', '.join(sorted(missing_keys))}**")
 
-        course_map = {} 
+        course_map = {}
         
-        # 📌 3. 데이터 처리 및 정제
         for row in reader:
             try:
-                # 4가지 숫자 필드 모두 공백 제거 및 숫자 유효성 검사 적용
-                
-                # 3-1. 교과목학점 (필요시간)
                 credits_str = row.get("교과목학점", "0").strip()
                 credits = int(credits_str) if credits_str.isdigit() else 0
-                
-                # 3-2. 개설학년
                 grade_str = row.get("개설학년", "0").strip()
                 grade = int(grade_str) if grade_str.isdigit() else 0
-                
-                # 3-3. 수강인원
                 capacity_str = row.get("수강인원", "0").strip()
                 capacity = int(capacity_str) if capacity_str.isdigit() else 0
-                
-                # 3-4. 수업주수
                 weeks_str = row.get("수업주수", "0").strip()
                 weeks = int(weeks_str) if weeks_str.isdigit() else 0
                 
-                
-                # 필수 데이터 (학점/학년/수강인원)가 0이거나 유효하지 않으면 이 강의는 건너뜀
                 if credits == 0 or grade == 0 or capacity == 0:
-                    continue 
-                
-                # 고유 ID 생성 (강좌담당교수 사용)
+                    continue
+
                 course_id = f"{row['교과목명']}_{row['강좌담당교수']}_{capacity}"
                 
-                # 학과명 정규화 (소프트웨어융합과(2022) 등을 처리)
+                preference_score = 0
+                preferred_days = []
+                for pref_key_index, pref_key in enumerate(PROFESSOR_PREF_KEYS):
+                    day_name = row.get(pref_key, "").strip()
+                    if day_name in DAY_MAP:
+                        score = 6 - (pref_key_index + 1) 
+                        preference_score += score
+                        preferred_days.append(day_name)
+                
                 dept = row["개설학과"].strip()
+                course_name = row["교과목명"].strip()
                 
                 course_map[course_id] = {
-                    "과목명": row["교과목명"],
+                    "과목명": course_name,
                     "교수": row["강좌담당교수"],
-                    "필요시간": credits, 
-                    "학년": grade,      
-                    "학과": dept, # 정규화된 학과명 사용
+                    "필요시간": credits,
+                    "학년": grade,
+                    "학과": dept,
                     "주수": weeks,
+                    "선호도_점수": preference_score, 
+                    "선호_요일": preferred_days,   
+                    "그룹_키": (course_name, dept), 
+                    # 캡스톤 과목 여부 플래그 추가
+                    "is_capstone": course_name.startswith("캡스톤")
                 }
             except ValueError:
-                # 데이터 처리 중 기타 오류 발생 시 해당 행 건너뛰기
                 pass
         
-        # 📌 4. 데이터 그룹화 및 최종 코스 목록 생성
         final_courses = []
-        course_counts = {}
-        
         valid_sw_depts = ["소프트웨어융합과", "코딩전공", "소프트웨어융합학과", "소프트웨어융합과(2022)"]
-        
+        split_class_trackers = {} 
+
         for course_id, course in course_map.items():
-            key = (course['과목명'], course['교수'], course['학과'])
-            course_counts[key] = course_counts.get(key, 0) + 1
-            count = course_counts[key]
             grade = course['학년']
+            dept = course['학과']
+            class_unit = None
             
-            if course['학과'] in valid_sw_depts:
+            if dept in valid_sw_depts:
                 if grade == 4:
                     class_unit = "SW-4"
                 elif grade in [1, 2, 3]:
-                    # 1학년, 2학년, 3학년 분반 로직 (A, B)
-                    if count == 1:
+                    tracker_key = (course['과목명'], dept, grade)
+                    if tracker_key not in split_class_trackers:
+                        split_class_trackers[tracker_key] = 'A'
+                    
+                    if split_class_trackers[tracker_key] == 'A':
                         class_unit = f"SW-{grade}A"
-                    elif count >= 2:
+                        split_class_trackers[tracker_key] = 'B'
+                    elif split_class_trackers[tracker_key] == 'B':
                         class_unit = f"SW-{grade}B"
-                    else: 
-                        continue
-                else:
-                    continue
                 
-            elif course['학과'] == "빅데이터과":
+            elif dept == "빅데이터과":
                 if 1 <= grade <= 3:
                     class_unit = f"BD-{grade}"
-                else:
-                    continue
-            else:
-                continue # 알 수 없는 학과는 건너뜀
-                
-            course['배정_단위'] = class_unit
-            course['id'] = course_id
-            final_courses.append(course)
-        
+
+            if class_unit:
+                course['배정_단위'] = class_unit
+                course['id'] = course_id
+                final_courses.append(course)
+
         unique_courses = []
         seen_ids = set()
         for course in final_courses:
@@ -164,37 +154,62 @@ def load_courses(file_path: str) -> List[Dict[str, Any]]:
         return unique_courses
         
     finally:
-        # 파일이 열려있다면 반드시 닫음 (f가 None이 아닐 경우)
         if f:
             f.close()
 
 
 # =========================================================================
-# ⚙️ 시간표 배정 함수 (schedule_courses) 
+# ⚙️ 시간표 배정 함수 (schedule_courses) - 강화된 최적화 및 제약 조건 적용
 # =========================================================================
 
 def schedule_courses(courses: List[Dict[str, Any]]) -> Tuple[Dict[Tuple[str, int, str], Tuple[str, str, str]], List[str]]:
-    room_schedule = {} 
+    room_schedule = {}
     professor_schedule = {}
-    class_schedule = {}
+    class_schedule = {} 
     unassigned_courses = []
 
-    courses.sort(key=lambda x: x['필요시간']) 
-    random.shuffle(courses)
+    # 1. 최적화된 정렬
+    courses.sort(key=lambda x: (-x['선호도_점수'], -x['필요시간']))
+    random.shuffle(courses) 
+
+    # 2. 학과/학년별 현재 배정 현황 추적 (균등 배정 최적화용)
+    class_day_load = {unit: {day: 0 for day in DAYS} for unit in ALL_CLASSES}
+    
+    # 강의실 분리
+    REGULAR_ROOMS = ROOMS[:-1] # 정규 강의실
+    EXTRA_ROOM = ["R_EXTRA"] # 추가 강의실
 
     for course in courses:
         assigned = False
         required_hours = course["필요시간"]
-        room_priority = sorted(ROOMS, key=lambda r: 1 if r == "R_EXTRA" else 0)
         class_unit = course["배정_단위"]
 
-        for day in random.sample(DAYS, len(DAYS)):
-            for room in room_priority:
+        # 3. 요일 탐색 순서 결정 (균등 배정 최적화 적용)
+        preferred_days = course["선호_요일"]
+        low_load_days = sorted(DAYS, key=lambda day: class_day_load[class_unit][day])
+        
+        search_days = []
+        # 선호 요일 & 부하 낮은 순
+        for day in low_load_days:
+            if day in preferred_days:
+                search_days.append(day)
+        # 나머지 요일 & 부하 낮은 순
+        for day in low_load_days:
+            if day not in search_days:
+                search_days.append(day)
+                
+        search_days = list(dict.fromkeys(search_days))
+
+        # ⭐️ 4. ATTEMPT 1: 정규 강의실(REGULAR_ROOMS)을 사용하여 모든 요일을 탐색 (선호 요일 우선)
+        for day in search_days:
+            for room in REGULAR_ROOMS:
                 start_hour = START_HOUR
+                
                 while start_hour + required_hours <= END_HOUR:
                     
                     conflict = False
                     
+                    # 4-1. 기본 충돌 조건 검사
                     for h in range(start_hour, start_hour + required_hours):
                         if (day, h, room) in room_schedule:
                             conflict = True
@@ -205,22 +220,124 @@ def schedule_courses(courses: List[Dict[str, Any]]) -> Tuple[Dict[Tuple[str, int
                         if (day, h, class_unit) in class_schedule:
                             conflict = True
                             break
-                            
+                    
+                    # 4-2. 연속 과목 수 3개 이상 금지 제약 조건 검사 (캡스톤은 예외)
+                    if not conflict and not course["is_capstone"]: 
+                        
+                        course_names_before = set()
+                        course_names_after = set()
+                        
+                        # 앞 블록 검사
+                        hour_before = start_hour - 1
+                        if hour_before >= START_HOUR and (day, hour_before, class_unit) in class_schedule:
+                            course_names_before.add(class_schedule[(day, hour_before, class_unit)])
+                            second_hour_before = hour_before - 1
+                            if second_hour_before >= START_HOUR and (day, second_hour_before, class_unit) in class_schedule:
+                                course_names_before.add(class_schedule[(day, second_hour_before, class_unit)])
+                                
+                        # 뒤 블록 검사
+                        hour_after = start_hour + required_hours
+                        if hour_after < END_HOUR and (day, hour_after, class_unit) in class_schedule:
+                            course_names_after.add(class_schedule[(day, hour_after, class_unit)])
+                            second_hour_after = hour_after + 1
+                            if second_hour_after < END_HOUR and (day, second_hour_after, class_unit) in class_schedule:
+                                course_names_after.add(class_schedule[(day, second_hour_after, class_unit)])
+                        
+                        adjacent_courses = course_names_before.union(course_names_after)
+                        current_course_name = course["과목명"]
+                        
+                        # 인접한 과목이 2개인데, 현재 과목이 이들과 모두 다르다면 3과목 연속으로 간주
+                        if len(adjacent_courses) == 2 and current_course_name not in adjacent_courses:
+                            conflict = True
+                    
                     if not conflict:
+                        # 배정 실행
                         for h in range(start_hour, start_hour + required_hours):
                             room_schedule[(day, h, room)] = (course["과목명"], class_unit, course["교수"])
                             professor_schedule[(day, h, course["교수"])] = course["과목명"]
                             class_schedule[(day, h, class_unit)] = course["과목명"]
                         
+                        # 부하 업데이트
+                        class_day_load[class_unit][day] += required_hours
+                        
                         assigned = True
-                        break 
+                        break # 시간 루프 탈출
                     
-                    start_hour += 1 
+                    start_hour += 1 # 다음 시작 시간으로 이동
 
                 if assigned:
-                    break
+                    break # 강의실 루프 탈출
             if assigned:
-                break
+                break # 요일 루프 탈출
+
+        # ⭐️ 5. ATTEMPT 2: 정규 강의실 배정 실패 시, 추가 강의실(R_EXTRA)을 사용하여 모든 요일을 탐색 (최후의 수단)
+        if not assigned:
+            for day in search_days:
+                for room in EXTRA_ROOM: # R_EXTRA만 탐색
+                    start_hour = START_HOUR
+                    
+                    while start_hour + required_hours <= END_HOUR:
+                        
+                        conflict = False
+                        
+                        # 5-1. 기본 충돌 조건 검사 (R_EXTRA 포함)
+                        for h in range(start_hour, start_hour + required_hours):
+                            if (day, h, room) in room_schedule:
+                                conflict = True
+                                break
+                            if (day, h, course["교수"]) in professor_schedule:
+                                conflict = True
+                                break
+                            if (day, h, class_unit) in class_schedule:
+                                conflict = True
+                                break
+                        
+                        # 5-2. 연속 과목 수 3개 이상 금지 제약 조건 검사 (캡스톤 예외 포함)
+                        if not conflict and not course["is_capstone"]: 
+                            
+                            course_names_before = set()
+                            course_names_after = set()
+                            
+                            hour_before = start_hour - 1
+                            if hour_before >= START_HOUR and (day, hour_before, class_unit) in class_schedule:
+                                course_names_before.add(class_schedule[(day, hour_before, class_unit)])
+                                second_hour_before = hour_before - 1
+                                if second_hour_before >= START_HOUR and (day, second_hour_before, class_unit) in class_schedule:
+                                    course_names_before.add(class_schedule[(day, second_hour_before, class_unit)])
+                                    
+                            hour_after = start_hour + required_hours
+                            if hour_after < END_HOUR and (day, hour_after, class_unit) in class_schedule:
+                                course_names_after.add(class_schedule[(day, hour_after, class_unit)])
+                                second_hour_after = hour_after + 1
+                                if second_hour_after < END_HOUR and (day, second_hour_after, class_unit) in class_schedule:
+                                    course_names_after.add(class_schedule[(day, second_hour_after, class_unit)])
+                            
+                            adjacent_courses = course_names_before.union(course_names_after)
+                            current_course_name = course["과목명"]
+                            
+                            if len(adjacent_courses) == 2 and current_course_name not in adjacent_courses:
+                                conflict = True
+                        
+                        
+                        if not conflict:
+                            # 배정 실행
+                            for h in range(start_hour, start_hour + required_hours):
+                                room_schedule[(day, h, room)] = (course["과목명"], class_unit, course["교수"])
+                                professor_schedule[(day, h, course["교수"])] = course["과목명"]
+                                class_schedule[(day, h, class_unit)] = course["과목명"]
+                            
+                            # 부하 업데이트
+                            class_day_load[class_unit][day] += required_hours
+                            
+                            assigned = True
+                            break # 시간 루프 탈출
+                        
+                        start_hour += 1 # 다음 시작 시간으로 이동
+
+                    if assigned:
+                        break # 강의실 루프 탈출
+                if assigned:
+                    break # 요일 루프 탈출
         
         if not assigned:
             unassigned_courses.append(course['과목명'] + f" ({class_unit})")
@@ -228,15 +345,15 @@ def schedule_courses(courses: List[Dict[str, Any]]) -> Tuple[Dict[Tuple[str, int
     return room_schedule, unassigned_courses
 
 # =========================================================================
-# 🎨 HTML 시각화 함수 (generate_full_html_schedule) 
+# 🎨 HTML 시각화 함수 (generate_full_html_schedule) - 변경 없음
 # =========================================================================
 
 def generate_full_html_schedule(schedule: Dict[Tuple[str, int, str], Tuple[str, str, str]], unassigned_courses: List[str]) -> str:
     
-    TEXT_COLOR = COLOR_MAP["TEXT"] 
+    TEXT_COLOR = COLOR_MAP["TEXT"]
     BG_COLOR_MAIN_HEADER = COLOR_MAP["HEADER_MAIN"]
     BG_COLOR_TIME_HEADER = COLOR_MAP["HEADER_TIME"]
-    BG_COLOR_EMPTY = "#ffffff" 
+    BG_COLOR_EMPTY = "#ffffff"
     
     THICK_BORDER = "2px solid #555"
     THIN_BORDER = "1px solid #ddd"
@@ -250,7 +367,7 @@ def generate_full_html_schedule(schedule: Dict[Tuple[str, int, str], Tuple[str, 
     full_html = f"<h2 style='text-align: center; color: {TEXT_COLOR};'>🏛️ 강의실 배정 결과 시간표 (학과 통합/분리) 🗓️</h2>"
     
     if unassigned_courses:
-        full_html += f"<div style='border: 2px solid red; padding: 10px; margin: 10px 0; background-color: #ffe0e0; color: #cc0000; font-weight: bold;'>⚠️ 배정 실패 과목: {', '.join(unassigned_courses)} - 시간/강의실/교수 충돌</div>"
+        full_html += f"<div style='border: 2px solid red; padding: 10px; margin: 10px 0; background-color: #ffe0e0; color: #cc0000; font-weight: bold;'>⚠️ 배정 실패 과목: {', '.join(unassigned_courses)} - 시간/강의실/교수/연속 강의 충돌</div>"
 
     
     table_style = f"width: 100%; border-collapse: collapse; text-align: center; font-size: 13px; color: {TEXT_COLOR}; table-layout: fixed;"
@@ -322,10 +439,11 @@ def generate_full_html_schedule(schedule: Dict[Tuple[str, int, str], Tuple[str, 
                         course_name, unit, professor_name = schedule[key]
                         
                         if unit == class_unit:
+                            room_display = room if room != "R_EXTRA" else "<span style='color: red; font-weight: bold;'>R_EXTRA</span>"
                             cell_content = (
                                 f"<div style='font-weight: bold; color: {TEXT_COLOR};'>{course_name}</div>"
                                 f"<div style='font-size: 11px; color: {TEXT_COLOR};'>({professor_name})</div>"
-                                f"<div style='font-size: 10px; color: #333; margin-top: 3px;'>{room}</div>" 
+                                f"<div style='font-size: 10px; color: #333; margin-top: 3px;'>{room_display}</div>" 
                             )
                             break
 
@@ -372,10 +490,11 @@ def generate_full_html_schedule(schedule: Dict[Tuple[str, int, str], Tuple[str, 
                         course_name, unit, professor_name = schedule[key]
                         
                         if unit == class_unit:
+                            room_display = room if room != "R_EXTRA" else "<span style='color: red; font-weight: bold;'>R_EXTRA</span>"
                             cell_content = (
                                 f"<div style='font-weight: bold; color: {TEXT_COLOR};'>{course_name}</div>"
                                 f"<div style='font-size: 11px; color: {TEXT_COLOR};'>({professor_name})</div>"
-                                f"<div style='font-size: 10px; color: #333; margin-top: 3px;'>{room}</div>"
+                                f"<div style='font-size: 10px; color: #333; margin-top: 3px;'>{room_display}</div>"
                             )
                             break
 
@@ -410,30 +529,24 @@ def generate_full_html_schedule(schedule: Dict[Tuple[str, int, str], Tuple[str, 
         full_html += f"<ul style='color: #cc0000; font-weight: bold;'>{extra_room_details}</ul>"
     else:
         full_html += "<p style='color: green;'>✅ 추가 강의실 (R_EXTRA)는 사용되지 않았습니다.</p>"
-        
+            
     return full_html
 
 
 # =========================================================================
-# 🚀 메인 스케줄러 실행 함수 (run_scheduler)
+# 🚀 메인 스케줄러 실행 함수 (run_scheduler) - 변경 없음
 # =========================================================================
 def run_scheduler(file_path: str) -> str:
-    """
-    주요 실행 함수. CSV 파일 경로를 받아 스케줄링을 실행하고 HTML을 반환합니다.
-    """
     
     try:
         courses = load_courses(file_path)
     except ValueError as e:
-        # load_courses에서 발생한 헤더/인코딩 오류를 그대로 전달
         return f"<div style='border: 2px solid red; padding: 20px; background-color: #ffe0e0; color: #cc0000; font-weight: bold;'>❌ 데이터 로드 실패: {e}</div>"
     except Exception:
-        # 기타 알 수 없는 오류
         return f"<div style='border: 2px solid red; padding: 20px; background-color: #ffe0e0; color: #cc0000; font-weight: bold;'>❌ 알 수 없는 오류가 발생했습니다. 파일 내용을 다시 한번 확인해주세요.</div>"
 
 
     if not courses:
-        # 데이터가 필터링 등으로 인해 완전히 비어버린 경우
         return f"<div style='border: 2px solid orange; padding: 20px; background-color: #fff3e0; color: #ff9800; font-weight: bold;'>⚠️ 경고: 파일에서 유효한 강의 데이터를 찾지 못했습니다. CSV 파일의 **개설학년, 교과목학점, 수강인원** 필드가 숫자로 채워져 있는지 확인해주세요.</div>"
     
     schedule, unassigned = schedule_courses(courses)
@@ -441,4 +554,3 @@ def run_scheduler(file_path: str) -> str:
     html_output = generate_full_html_schedule(schedule, unassigned)
     
     return html_output
-
